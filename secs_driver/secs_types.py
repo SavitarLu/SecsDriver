@@ -5,8 +5,7 @@ SECS-II 数据类型定义
 """
 
 from enum import IntEnum
-from typing import Any, List, Optional, Union
-import struct
+from typing import Optional
 
 
 class SECSType(IntEnum):
@@ -83,61 +82,6 @@ class SECSTypeInfo:
     def is_fixed_size(cls, secs_type: SECSType) -> bool:
         """判断是否为固定大小类型"""
         return secs_type in cls.TYPE_SIZES
-
-
-def encode_length(length: int) -> bytes:
-    """
-    编码长度字段
-
-    SECS-II 使用 1-3 字节编码长度值：
-    - 0-63: 单字节
-    - 64-16383: 双字节
-    - 16384-4194303: 三字节
-    """
-    if length < 0:
-        raise ValueError("Length cannot be negative")
-
-    if length <= 0x3F:  # 63
-        return bytes([length])
-    elif length <= 0x3FFF:  # 16383
-        return struct.pack(">H", 0x8000 | length)
-    elif length <= 0x3FFFFF:  # 4194303
-        b1 = (length >> 16) & 0x3F
-        b2 = (length >> 8) & 0xFF
-        b3 = length & 0xFF
-        return bytes([0xC0 | b1, b2, b3])
-    else:
-        raise ValueError(f"Length {length} exceeds maximum (4194303)")
-
-
-def decode_length(data: bytes, offset: int) -> tuple[int, int]:
-    """
-    解码长度字段
-
-    Args:
-        data: 数据缓冲区
-        offset: 起始偏移
-
-    Returns:
-        (length, bytes_consumed): 解码的长度值和消耗的字节数
-    """
-    if offset >= len(data):
-        raise ValueError("Buffer underflow")
-
-    first_byte = data[offset]
-
-    if first_byte & 0x80 == 0:  # 0xxxxxxx: 单字节
-        return first_byte, 1
-    elif first_byte & 0xC0 == 0x80:  # 10xxxxxx: 双字节
-        if offset + 1 >= len(data):
-            raise ValueError("Buffer underflow")
-        length = ((first_byte & 0x3F) << 8) | data[offset + 1]
-        return length, 2
-    else:  # 11xxxxxx: 三字节
-        if offset + 2 >= len(data):
-            raise ValueError("Buffer underflow")
-        length = ((first_byte & 0x3F) << 16) | (data[offset + 1] << 8) | data[offset + 2]
-        return length, 3
 
 
 def encode_format(secs_type: SECSType, length: int) -> bytes:

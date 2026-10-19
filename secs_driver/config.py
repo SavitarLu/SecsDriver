@@ -21,10 +21,11 @@ class ConnectionConfig:
     mode: str = "active"  # "active" 或 "passive"
     host: str = "127.0.0.1"
     port: int = 5000
-    timeout: float = 30.0  # 连接超时（秒）
+    timeout: float = 30.0  # 连接/发送超时（秒）
     retry_interval: float = 5.0  # 重连间隔（秒）
-    max_retry: int = 3  # 最大重试次数
+    max_retry: int = 3  # 最大连续重试次数；<=0 表示无限重连
     keepalive: bool = True  # 是否启用 TCP Keepalive
+    auto_reconnect: bool = True  # 连接意外断开后是否自动重连
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
@@ -36,6 +37,7 @@ class ConnectionConfig:
             "retry_interval": self.retry_interval,
             "max_retry": self.max_retry,
             "keepalive": self.keepalive,
+            "auto_reconnect": self.auto_reconnect,
         }
 
     @classmethod
@@ -49,10 +51,11 @@ class HSMSConfig:
     """HSMS 协议配置"""
 
     t3_timeout: float = 45.0  # 事务超时（秒）
-    t5_timeout: float = 10.0  # 连接分隔超时（秒）
-    t6_timeout: float = 5.0  # 控制会话超时（秒）
+    t5_timeout: float = 10.0  # 连接分隔超时（秒），也用作链路空闲检查周期
+    t6_timeout: float = 5.0  # 控制会话超时（秒），Linktest 响应等待时间
     t7_timeout: float = 10.0  # 等待 Select 超时（秒）
-    t8_timeout: float = 5.0  # 网络重试超时（秒）
+    t8_timeout: float = 5.0  # 网络重试超时（秒）（预留，当前未使用）
+    max_frame_size: int = 16 * 1024 * 1024  # 单个 HSMS 报文最大字节数，防御异常长度字段
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
@@ -62,6 +65,7 @@ class HSMSConfig:
             "t6_timeout": self.t6_timeout,
             "t7_timeout": self.t7_timeout,
             "t8_timeout": self.t8_timeout,
+            "max_frame_size": self.max_frame_size,
         }
 
     @classmethod
@@ -77,6 +81,7 @@ class MessageQueueConfig:
     max_queue_size: int = 1000  # 最大队列大小
     max_retry: int = 3  # 最大重试次数
     retry_delay: float = 1.0  # 重试延迟（秒）
+    max_in_flight: int = 16  # 并发发送/等待回复的最大消息数
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
@@ -84,6 +89,7 @@ class MessageQueueConfig:
             "max_queue_size": self.max_queue_size,
             "max_retry": self.max_retry,
             "retry_delay": self.retry_delay,
+            "max_in_flight": self.max_in_flight,
         }
 
     @classmethod
@@ -225,20 +231,23 @@ secs_driver:
     port: 5000
     timeout: 30.0
     retry_interval: 5.0
-    max_retry: 3
+    max_retry: 3             # <=0 表示断开后无限重连
     keepalive: true
+    auto_reconnect: true     # 连接意外断开后自动重连
 
   hsms:
     t3_timeout: 45.0         # 事务超时
-    t5_timeout: 10.0         # 连接分隔超时
-    t6_timeout: 5.0          # 控制会话超时
+    t5_timeout: 10.0         # 连接分隔超时（也用作链路空闲检查周期）
+    t6_timeout: 5.0          # 控制会话超时（Linktest 响应等待）
     t7_timeout: 10.0         # 等待 Select 超时
-    t8_timeout: 5.0          # 网络重试超时
+    t8_timeout: 5.0          # 网络重试超时（预留）
+    max_frame_size: 16777216 # 单个 HSMS 报文最大字节数（防异常长度）
 
   message_queue:
     max_queue_size: 1000
     max_retry: 3
     retry_delay: 1.0
+    max_in_flight: 16        # 并发发送/等待回复的消息数上限
 
   logging:
     level: "INFO"

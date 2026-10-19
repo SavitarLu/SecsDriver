@@ -6,15 +6,21 @@ SECS Driver 主类
 
 import asyncio
 import logging
-from typing import Optional, Callable, Dict, Any, List
+import time
+from typing import Optional, Callable, List
 
-from .config import DriverConfig, ConnectionConfig, HSMSConfig, MessageQueueConfig, LoggingConfig
-from .connection import TCPConnection, TCPClient, TCPServer, create_connection
+from .config import DriverConfig, ConnectionConfig, HSMSConfig
+from .connection import TCPConnection, create_connection
 from .session import SessionManager
 from .message_handler import MessageHandler
 from .secs_message import SECSMessage, SECSItem
 from .secs_parser import SECSEncoder, SECSParser
-from .hsms_protocol import HSMSConnectionState, HSMSProtocolHandler, HSMSConnectionStateMachine
+from .hsms_protocol import (
+    HSMSConnectionState,
+    HSMSConnectionStateMachine,
+    HSMSMessage,
+)
+from .task_utils import spawn
 
 
 logger = logging.getLogger(__name__)
@@ -89,8 +95,12 @@ class SECSDriver:
 
         # 状态
         self._running = False
-        self._receive_task: Optional[asyncio.Task] = None
         self._linktest_task: Optional[asyncio.Task] = None
+        self._select_timeout_task: Optional[asyncio.Task] = None
+
+        # 链路状态追踪
+        self._last_activity: float = 0.0  # 最近一次收发时间（monotonic）
+        self._linktest_pending: Optional[tuple] = None  # (发送时间, system_bytes)
 
         # 日志配置
         self._setup_logging()
@@ -98,26 +108,31 @@ class SECSDriver:
         logger.info(f"SECS Driver initialized: {self.config.name}")
 
     def _setup_logging(self) -> None:
-        """配置日志"""
+        """
+        配置本包日志。
+
+        只操作 "secs_driver" 包日志器，不触碰宿主应用的 root logger。
+        """
         log_config = self.config.logging
 
-        # 创建日志格式
         formatter = logging.Formatter(
             "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
         )
 
-        # 配置根日志器
-        root_logger = logging.getLogger()
-        root_logger.setLevel(getattr(logging, log_config.level.upper(), logging.INFO))
+        package_logger = logging.getLogger(__package__ or "secs_driver")
+        package_logger.setLevel(getattr(logging, log_config.level.upper(), logging.INFO))
+        package_logger.propagate = False
 
-        # 清除现有处理器
-        root_logger.handlers.clear()
+        # 清除本包此前安装的处理器（重复创建 Driver 时避免重复输出）
+        for handler in list(package_logger.handlers):
+            package_logger.removeHandler(handler)
+            handler.close()
 
         # 添加控制台处理器
         if log_config.console:
             console_handler = logging.StreamHandler()
             console_handler.setFormatter(formatter)
-            root_logger.addHandler(console_handler)
+            package_logger.addHandler(console_handler)
 
         # 添加文件处理器
         if log_config.file:
@@ -130,7 +145,7 @@ class SECSDriver:
                     backupCount=log_config.backup_count,
                 )
                 file_handler.setFormatter(formatter)
-                root_logger.addHandler(file_handler)
+                package_logger.addHandler(file_handler)
             except Exception as e:
                 logger.warning(f"Failed to setup file logging: {e}")
 
@@ -174,6 +189,7 @@ class SECSDriver:
             # 设置连接回调
             self._connection.set_callback("connected", self._on_connected)
             self._connection.set_callback("disconnected", self._on_disconnected)
+            self._connection.set_callback("connection_failed", self._on_connection_failed)
             self._connection.set_callback("data_received", self._on_data_received)
             self._connection.set_callback("client_connected", self._on_client_connected)
             self._connection.set_callback("client_disconnected", self._on_client_disconnected)
@@ -185,10 +201,12 @@ class SECSDriver:
             self._session_manager.set_callback("send_with_reply", self._on_send_message)
             self._session_manager.set_callback("send_no_reply", self._on_send_message)
             self._session_manager.set_callback("separated", self._on_separated)
+            self._session_manager.set_callback("linktest_response", self._on_linktest_response)
 
             # 设置消息处理器回调
             self._message_handler.set_callback("message_sent", self._on_message_sent)
             self._message_handler.set_callback("timeout", self._on_timeout)
+            self._message_handler.set_callback("send_failed", self._on_send_failed)
 
             # 建立 TCP 连接
             connected = await self._connection.connect()
@@ -200,9 +218,9 @@ class SECSDriver:
             # 启动消息处理器
             await self._message_handler.start()
 
-            # 启动接收循环
             self._running = True
-            self._receive_task = asyncio.create_task(self._receive_loop())
+            self._last_activity = time.monotonic()
+            self._linktest_pending = None
 
             # 启动链路测试
             self._linktest_task = asyncio.create_task(self._linktest_loop())
@@ -228,14 +246,15 @@ class SECSDriver:
                 await self._linktest_task
             except asyncio.CancelledError:
                 pass
+            self._linktest_task = None
 
-        # 停止接收循环
-        if self._receive_task:
-            self._receive_task.cancel()
-            try:
-                await self._receive_task
-            except asyncio.CancelledError:
-                pass
+        # 停止 Select 超时计时
+        self._cancel_select_timeout()
+        self._linktest_pending = None
+
+        # 取消未完成事务，避免等待方悬挂
+        if self._session_manager:
+            await self._session_manager.cancel_all_transactions(reason="driver stopped")
 
         # 停止消息处理器
         if self._message_handler:
@@ -250,6 +269,10 @@ class SECSDriver:
     async def _on_connected(self) -> None:
         """连接建立回调"""
         logger.info("TCP connection established")
+        self._last_activity = time.monotonic()
+        self._linktest_pending = None
+        if self._session_manager:
+            self._session_manager.protocol.reset()
         if self._state_machine:
             self._state_machine.handle_tcp_connected()
         self._trigger_event("on_connected", 0)
@@ -258,13 +281,34 @@ class SECSDriver:
     async def _on_disconnected(self) -> None:
         """连接断开回调"""
         logger.info("TCP connection lost")
+        await self._handle_transport_lost("Connection lost")
+
+    async def _on_connection_failed(self, retry_count: int) -> None:
+        """重连彻底失败回调"""
+        logger.error(f"Connection failed after {retry_count} reconnect attempts")
+        self._trigger_event(
+            "on_error",
+            ConnectionError(f"Connection failed after {retry_count} reconnect attempts"),
+        )
+
+    async def _handle_transport_lost(self, reason: str) -> None:
+        """传输层断开后的统一清理。"""
+        self._linktest_pending = None
+        self._cancel_select_timeout()
         if self._state_machine:
             self._state_machine.handle_tcp_disconnected()
-        self._trigger_event("on_disconnected", 0, "Connection lost")
+        if self._session_manager:
+            self._session_manager.protocol.reset()
+            await self._session_manager.cancel_all_transactions(reason=reason)
+        self._trigger_event("on_disconnected", 0, reason)
 
     async def _on_client_connected(self, address: tuple) -> None:
         """客户端连接回调（被动模式）"""
         logger.info(f"Client connected from {address}")
+        self._last_activity = time.monotonic()
+        self._linktest_pending = None
+        if self._session_manager:
+            self._session_manager.protocol.reset()
         if self._state_machine:
             self._state_machine.handle_tcp_connected()
         self._trigger_event("on_connected", 0)
@@ -272,9 +316,7 @@ class SECSDriver:
     async def _on_client_disconnected(self, address: tuple) -> None:
         """客户端断开回调（被动模式）"""
         logger.info(f"Client disconnected: {address}")
-        if self._state_machine:
-            self._state_machine.handle_tcp_disconnected()
-        self._trigger_event("on_disconnected", 0, f"Client disconnected: {address}")
+        await self._handle_transport_lost(f"Client disconnected: {address}")
 
     async def _on_data_received(self, data: bytes) -> None:
         """数据接收回调"""
@@ -287,6 +329,9 @@ class SECSDriver:
         """状态变化回调"""
         logger.info(f"State changed: {old_state} -> {new_state}")
 
+        if new_state != HSMSConnectionState.WAIT_SELECT:
+            self._cancel_select_timeout()
+
         if new_state == HSMSConnectionState.SELECTED:
             self._trigger_event("on_selected")
         elif new_state == HSMSConnectionState.NOT_SELECTED:
@@ -294,17 +339,33 @@ class SECSDriver:
 
     async def _on_message_received(self, message: SECSMessage) -> None:
         """消息接收回调"""
+        self._last_activity = time.monotonic()
         self._trigger_event("on_message_received", message)
 
     async def _on_separated(self) -> None:
-        """收到对端 Separate 请求。"""
+        """收到对端 Separate 请求：通知上层并按规范关闭 TCP 连接。"""
         self._trigger_event("on_separated")
+        if self._connection is not None:
+            await self._connection.force_reconnect()
+
+    async def _on_linktest_response(self, hsms_message: HSMSMessage) -> None:
+        """Linktest 响应：清除挂起标记。"""
+        self._last_activity = time.monotonic()
+        if self._linktest_pending is None:
+            logger.debug("Unexpected linktest response")
+            return
+        _, expected = self._linktest_pending
+        if hsms_message.system_bytes != expected:
+            logger.warning("Linktest response system bytes mismatch")
+            return
+        self._linktest_pending = None
 
     async def _on_send_control(self, data: bytes) -> None:
         """发送控制消息"""
         if self._connection and self._connection.is_connected:
             try:
                 await self._connection.send(data)
+                self._last_activity = time.monotonic()
             except Exception as e:
                 logger.error(f"Failed to send control message: {e}")
 
@@ -314,74 +375,84 @@ class SECSDriver:
         """发送数据消息。"""
         if not self._connection or not self._connection.is_connected:
             logger.warning(f"Skip sending {message.sf}, transport is not connected")
+            if self._session_manager:
+                await self._session_manager.cancel_transaction(tid)
             return
 
         try:
             await self._connection.send(data)
+            self._last_activity = time.monotonic()
             logger.debug(f"Sent {message.sf} (tid={tid})")
         except Exception as e:
             logger.error(f"Failed to send {message.sf}: {e}")
+            # 发送失败：立即结束事务，避免等待方滞留到 T3 超时
+            if self._session_manager:
+                await self._session_manager.cancel_transaction(tid)
 
     async def _on_message_sent(self, message: SECSMessage) -> None:
         """消息发送回调"""
+        self._last_activity = time.monotonic()
         self._trigger_event("on_message_sent", message)
 
     async def _on_timeout(self, message: SECSMessage) -> None:
         """消息超时回调"""
         self._trigger_event("on_timeout", message)
 
-    async def _receive_loop(self) -> None:
-        """接收数据循环"""
-        while self._running:
-            try:
-                if self._connection and self._connection.is_connected:
-                    # 对于被动模式，检查是否有客户端
-                    if isinstance(self._connection, TCPServer):
-                        if not self._connection.has_client:
-                            await asyncio.sleep(0.1)
-                        else:
-                            # 被动模式的数据由 TCPServer 内部回调驱动，避免双重读取同一 socket
-                            await asyncio.sleep(0.1)
-                        continue
-
-                    data = await self._connection.receive(4096)
-                    if data:
-                        await self._on_data_received(data)
-                else:
-                    await asyncio.sleep(0.1)
-
-            except asyncio.CancelledError:
-                break
-
-            except Exception as e:
-                logger.error(f"Receive loop error: {e}")
-                await asyncio.sleep(1)
+    async def _on_send_failed(self, message: SECSMessage, error: Exception) -> None:
+        """队列消息重试耗尽回调"""
+        logger.error(f"Message {message.sf} permanently failed: {error}")
+        self._trigger_event("on_error", error)
 
     async def _linktest_loop(self) -> None:
-        """链路测试循环"""
-        interval = self.config.hsms.t5_timeout / 2  # T5 超时的一半
+        """
+        链路维护循环：
+
+        - 链路空闲达到检查周期时发送 Linktest.req；
+        - 已发出但超过 T6 未收到响应，视为链路故障并触发重连。
+        """
+        interval = max(self.config.hsms.t5_timeout / 2, 1.0)
 
         while self._running:
             await asyncio.sleep(interval)
 
-            if (
+            if not (
                 self._running
                 and self._connection
                 and self._connection.is_connected
                 and self._session_manager
                 and self._session_manager.is_selected
             ):
-                try:
-                    # 发送 Linktest 请求
-                    msg = self._session_manager.protocol.create_linktest_request()
-                    data = self._session_manager.protocol.encode_message(msg)
-                    await self._connection.send(data)
-                    logger.debug("Linktest request sent")
-                except Exception as e:
-                    logger.warning(f"Linktest failed: {e}")
+                continue
+
+            now = time.monotonic()
+
+            if self._linktest_pending is not None:
+                sent_at, _ = self._linktest_pending
+                if now - sent_at >= self.config.hsms.t6_timeout:
+                    logger.error("Linktest response timeout (T6); link considered broken")
+                    self._linktest_pending = None
+                    self._trigger_event(
+                        "on_error", TimeoutError("Linktest response timeout (T6)")
+                    )
+                    await self._connection.force_reconnect()
+                continue
+
+            # 链路仍有活动时跳过 Linktest
+            if now - self._last_activity < interval:
+                continue
+
+            try:
+                msg = self._session_manager.protocol.create_linktest_request()
+                data = self._session_manager.protocol.encode_message(msg)
+                self._linktest_pending = (now, msg.system_bytes)
+                self._last_activity = now
+                await self._connection.send(data)
+                logger.debug("Linktest request sent")
+            except Exception as e:
+                logger.warning(f"Linktest failed: {e}")
 
     async def _send_select_request_if_needed(self) -> None:
-        """主动模式下在 TCP 建立后发起 Select。"""
+        """主动模式下在 TCP 建立后发起 Select，并启动 T7 超时计时。"""
         if (
             self.config.connection.mode.lower() != "active"
             or not self._state_machine
@@ -398,22 +469,64 @@ class SECSDriver:
             data = self._session_manager.protocol.encode_message(request)
             await self._connection.send(data)
             logger.info("Select request sent")
+            self._start_select_timeout()
         except Exception as e:
             logger.error(f"Failed to send Select request: {e}")
 
+    def _start_select_timeout(self) -> None:
+        """启动 T7：等待 Select.rsp 超时则重连。"""
+        self._cancel_select_timeout()
+        self._select_timeout_task = spawn(
+            self._wait_select_timeout(), name="select_timeout"
+        )
+
+    def _cancel_select_timeout(self) -> None:
+        """取消 T7 计时。"""
+        task, self._select_timeout_task = self._select_timeout_task, None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _wait_select_timeout(self) -> None:
+        await asyncio.sleep(self.config.hsms.t7_timeout)
+
+        if (
+            self._session_manager
+            and self._session_manager.state == HSMSConnectionState.WAIT_SELECT
+        ):
+            logger.error("Select response timeout (T7); reconnecting")
+            self._trigger_event("on_error", TimeoutError("Select response timeout (T7)"))
+            if self._connection is not None:
+                await self._connection.force_reconnect()
+
+    async def _invoke_event(self, method: Callable, method_name: str, *args) -> None:
+        """执行事件回调（含异常兜底）。"""
+        try:
+            await method(*args)
+        except Exception as e:
+            logger.error(f"Event handler error in {method_name}: {e}")
+            if method_name != "on_error":
+                self._trigger_event("on_error", e)
+
     def _trigger_event(self, method_name: str, *args, **kwargs) -> None:
         """触发事件回调"""
-        if self._event_handler:
-            method = getattr(self._event_handler, method_name, None)
-            if method:
-                try:
-                    if asyncio.iscoroutinefunction(method):
-                        asyncio.create_task(method(*args, **kwargs))
-                    else:
-                        method(*args, **kwargs)
-                except Exception as e:
-                    logger.error(f"Event handler error in {method_name}: {e}")
-                    self._trigger_event("on_error", e)
+        handler = self._event_handler
+        if handler is None:
+            return
+
+        method = getattr(handler, method_name, None)
+        if method is None:
+            return
+
+        try:
+            if asyncio.iscoroutinefunction(method):
+                # 保存任务引用并统一记录未处理异常
+                spawn(self._invoke_event(method, method_name, *args), name=method_name)
+            else:
+                method(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Event handler error in {method_name}: {e}")
+            if method_name != "on_error":
+                self._trigger_event("on_error", e)
 
     # ==================== 公开 API ====================
 
@@ -433,10 +546,10 @@ class SECSDriver:
             function: Function 编号
             items: 消息数据项列表
             wait_reply: 是否等待回复
-            timeout: 超时时间（秒）
+            timeout: 超时时间（秒）；None 时使用会话默认 T3
 
         Returns:
-            回复消息
+            回复消息；超时或连接断开时返回 None
         """
         if not self._message_handler:
             raise RuntimeError("Driver not connected")
@@ -512,15 +625,70 @@ class SECSDriver:
         if not self._message_handler:
             return False
 
-        # 创建回复
+        if not self.is_selected:
+            logger.warning("Cannot send reply: session is not selected")
+            return False
+
+        # 创建回复（沿用原消息的 system bytes）
         reply = original_message.create_reply(items)
 
         try:
-            await self._message_handler.send(reply, wait_reply=False)
-            return True
+            return await self._message_handler.try_send(reply)
         except Exception as e:
             logger.error(f"Failed to send reply: {e}")
             return False
+
+    async def deselect(self) -> bool:
+        """
+        发送 Deselect.request，会话进入 NOT_SELECTED。
+
+        Returns:
+            请求是否成功发出
+        """
+        if (
+            not self._connection
+            or not self._connection.is_connected
+            or not self._session_manager
+        ):
+            return False
+
+        message = self._session_manager.protocol.create_deselect_request()
+        try:
+            data = self._session_manager.protocol.encode_message(message)
+            await self._connection.send(data)
+            logger.info("Deselect request sent")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send Deselect request: {e}")
+            return False
+
+    async def separate(self) -> bool:
+        """
+        发送 Separate.request 并断开当前 TCP 连接。
+
+        Returns:
+            请求是否成功发出
+        """
+        if (
+            not self._connection
+            or not self._connection.is_connected
+            or not self._session_manager
+        ):
+            return False
+
+        message = self._session_manager.protocol.create_separate_request()
+        sent = False
+        try:
+            data = self._session_manager.protocol.encode_message(message)
+            await self._connection.send(data)
+            sent = True
+            logger.info("Separate request sent")
+        except Exception as e:
+            logger.error(f"Failed to send Separate request: {e}")
+
+        # 按规范关闭 TCP 连接（主动模式会按配置重连）
+        await self._connection.force_reconnect()
+        return sent
 
     def encode_message(self, message: SECSMessage) -> bytes:
         """
@@ -576,7 +744,7 @@ class SECSDriver:
 
     @property
     def pending_count(self) -> int:
-        """获取待回复消息数量"""
+        """获取进行中的发送任务数量（含等待回复）"""
         if self._message_handler:
             return self._message_handler.get_pending_count()
         return 0

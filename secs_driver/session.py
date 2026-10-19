@@ -7,17 +7,19 @@
 import asyncio
 import logging
 import time
-from typing import Dict, Optional, Callable, Any
+from typing import Dict, Optional, Callable
 from dataclasses import dataclass, field
 
+from .config import HSMSConfig
 from .hsms_protocol import (
     HSMSProtocolHandler,
     HSMSMessage,
     HSMSMessageType,
-    HSMSConfig,
+    HSMSRejectReason,
     HSMSConnectionState,
 )
 from .secs_message import SECSMessage
+from .task_utils import spawn
 
 
 logger = logging.getLogger(__name__)
@@ -34,7 +36,8 @@ class Transaction:
     completed: bool = False
     timeout: float = 45.0
     future: Optional[asyncio.Future] = None
-    callback: Optional[Callable] = None
+    # 完成通知：收到回复时传回复消息，超时/断开时传 None
+    callback: Optional[Callable[[Optional[SECSMessage]], None]] = None
 
 
 class SessionManager:
@@ -72,13 +75,15 @@ class SessionManager:
 
     def _trigger_callback(self, event: str, *args, **kwargs) -> None:
         """触发回调"""
-        if event in self._callbacks:
-            try:
-                result = self._callbacks[event](*args, **kwargs)
-                if asyncio.iscoroutine(result):
-                    asyncio.create_task(result)
-            except Exception as e:
-                logger.error(f"Callback error for {event}: {e}")
+        callback = self._callbacks.get(event)
+        if callback is None:
+            return
+        try:
+            result = callback(*args, **kwargs)
+            if asyncio.iscoroutine(result):
+                spawn(result, name=f"SessionManager.{event}")
+        except Exception as e:
+            logger.error(f"Callback error for {event}: {e}")
 
     async def initialize(self, state_machine) -> None:
         """初始化会话管理器"""
@@ -157,7 +162,7 @@ class SessionManager:
             transaction = Transaction(
                 tid=tid,
                 request=secs_message,
-                timeout=timeout or self.config.t3_timeout,
+                timeout=timeout if timeout is not None else self.config.t3_timeout,
                 future=asyncio.get_running_loop().create_future(),
                 callback=callback,
             )
@@ -180,21 +185,46 @@ class SessionManager:
         if tid in self._timeout_tasks:
             self._timeout_tasks[tid].cancel()
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         task = loop.create_task(self._handle_timeout(tid, timeout))
         self._timeout_tasks[tid] = task
 
     async def _handle_timeout(self, tid: int, timeout: float) -> None:
-        """处理事务超时"""
+        """处理事务超时：通知等待方并清理。"""
         await asyncio.sleep(timeout)
 
-        if tid in self._transactions:
-            transaction = self._transactions[tid]
-            if not transaction.completed:
-                logger.warning(f"Transaction {tid} timed out")
-                transaction.future.set_exception(TimeoutError(f"Transaction {tid} timed out"))
-                self._trigger_callback("timeout", tid)
-                await self._cleanup_transaction(tid)
+        transaction = self._transactions.get(tid)
+        if transaction is None or transaction.completed:
+            return
+
+        transaction.completed = True
+        logger.warning(f"Transaction {tid} timed out")
+        self._timeout_tasks.pop(tid, None)
+
+        # 完成 future 与回调，保证等待方（MessageHandler.send）能及时返回
+        self._complete_future(transaction, None)
+        self._invoke_callback(transaction, None)
+        self._trigger_callback("timeout", tid)
+
+        await self._cleanup_transaction(tid)
+
+    def _complete_future(
+        self, transaction: Transaction, result: Optional[SECSMessage]
+    ) -> None:
+        """完成事务 future（如果有等待者）。"""
+        if transaction.future is not None and not transaction.future.done():
+            transaction.future.set_result(result)
+
+    def _invoke_callback(
+        self, transaction: Transaction, result: Optional[SECSMessage]
+    ) -> None:
+        """调用事务回调；result 为 None 表示超时/断开。"""
+        if transaction.callback is None:
+            return
+        try:
+            transaction.callback(result)
+        except Exception as e:
+            logger.error(f"Transaction callback error: {e}")
 
     async def receive_message(self, data: bytes) -> Optional[SECSMessage]:
         """
@@ -213,18 +243,38 @@ class SessionManager:
                 await self._handle_control_message(hsms_message)
                 continue
 
-            if hsms_message.secs_message:
-                secs_message = hsms_message.secs_message
-                tid = self._bytes_to_tid(secs_message.system_bytes)
+            secs_message = hsms_message.secs_message
+            if secs_message is None:
+                continue
 
-                if tid in self._transactions:
-                    await self._complete_transaction(tid, secs_message)
-                else:
-                    self._trigger_callback("message_received", secs_message)
+            # 未 Selected 时收到数据消息：按 HSMS 规范回 Reject.req
+            if not self.is_selected:
+                self._reject_not_selected(hsms_message)
+                continue
 
-                last_message = secs_message
+            tid = self._bytes_to_tid(secs_message.system_bytes)
+
+            if tid in self._transactions:
+                await self._complete_transaction(tid, secs_message)
+            else:
+                self._trigger_callback("message_received", secs_message)
+
+            last_message = secs_message
 
         return last_message
+
+    def _reject_not_selected(self, hsms_message: HSMSMessage) -> None:
+        """未 Selected 时收到数据消息，回 Reject.req (reason=4)。"""
+        logger.warning(
+            "Data message received while not selected; sending Reject.req "
+            f"(system_bytes={hsms_message.system_bytes.hex()})"
+        )
+        reject = self.protocol.create_reject_request(
+            HSMSRejectReason.ENTITY_NOT_SELECTED,
+            system_bytes=hsms_message.system_bytes,
+        )
+        data = self.protocol.encode_message(reject)
+        self._trigger_callback("send_control_message", data)
 
     async def _handle_control_message(self, hsms_message: HSMSMessage) -> None:
         """处理 HSMS 控制消息"""
@@ -241,9 +291,12 @@ class SessionManager:
                     self._trigger_callback("send_control_message", data)
 
         elif msg_type == HSMSMessageType.SELECT_RESPONSE:
-            # 处理 Select 响应
+            # 处理 Select 响应（校验 system bytes 与 SelectStatus）
             if self._state_machine:
-                accepted = self._state_machine.handle_select_response()
+                accepted = self._state_machine.handle_select_response(
+                    system_bytes=hsms_message.system_bytes,
+                    status=hsms_message.stream,
+                )
                 if accepted:
                     self._trigger_callback("selected")
 
@@ -279,6 +332,11 @@ class SessionManager:
                 self._state_machine.handle_separate_request()
             self._trigger_callback("separated")
 
+        elif msg_type == HSMSMessageType.REJECT_REQUEST:
+            # 对端拒绝：记录原因码（Byte2）
+            logger.warning(f"Received Reject.req, reason={hsms_message.stream}")
+            self._trigger_callback("reject_received", hsms_message)
+
     async def _complete_transaction(self, tid: int, reply: SECSMessage) -> None:
         """完成事务"""
         if tid not in self._transactions:
@@ -293,16 +351,9 @@ class SessionManager:
             self._timeout_tasks[tid].cancel()
             del self._timeout_tasks[tid]
 
-        # 完成 Future 或调用回调
-        if transaction.future and not transaction.future.done():
-            transaction.future.set_result(reply)
-
-        if transaction.callback:
-            try:
-                transaction.callback(reply)
-            except Exception as e:
-                logger.error(f"Transaction callback error: {e}")
-
+        # 完成 Future 并通知回调
+        self._complete_future(transaction, reply)
+        self._invoke_callback(transaction, reply)
         self._trigger_callback("reply_received", reply, tid)
 
         await self._cleanup_transaction(tid)
@@ -316,14 +367,29 @@ class SessionManager:
             del self._timeout_tasks[tid]
 
     async def cancel_transaction(self, tid: int) -> bool:
-        """取消事务"""
-        if tid in self._transactions:
-            transaction = self._transactions[tid]
-            if transaction.future and not transaction.future.done():
-                transaction.future.cancel()
-            await self._cleanup_transaction(tid)
-            return True
-        return False
+        """取消事务（等待方会收到 None 通知）。"""
+        transaction = self._transactions.get(tid)
+        if transaction is None:
+            return False
+
+        transaction.completed = True
+        task = self._timeout_tasks.pop(tid, None)
+        if task is not None:
+            task.cancel()
+
+        self._complete_future(transaction, None)
+        self._invoke_callback(transaction, None)
+        await self._cleanup_transaction(tid)
+        return True
+
+    async def cancel_all_transactions(self, reason: str = "connection lost") -> None:
+        """取消全部未完成事务（断开连接时调用，避免等待方悬挂）。"""
+        if not self._transactions:
+            return
+
+        logger.info(f"Cancelling {len(self._transactions)} pending transaction(s): {reason}")
+        for tid in list(self._transactions.keys()):
+            await self.cancel_transaction(tid)
 
     def get_pending_transactions(self) -> Dict[int, Transaction]:
         """获取待处理事务"""

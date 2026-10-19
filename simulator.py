@@ -15,12 +15,12 @@ from concurrent.futures import Future
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-from src.model_templates import (
+from secs_driver.model_templates import (
     DEFAULT_MODEL_XML,
     MessageTemplate,
     load_model_templates,
 )
-from src.simulator_core import SimulatorEndpoint, SimulatorEvent
+from secs_driver.simulator_core import SimulatorEndpoint, SimulatorEvent
 
 
 HELP_TEXT = (

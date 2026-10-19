@@ -349,7 +349,7 @@ class SimulatorEndpoint(SECSEventHandler):
         self._emit("tx", message_to_text(message), message=message)
 
     def on_timeout(self, message: SECSMessage) -> None:
-        self._emit("error", f"消息超时: {message.sf}")
+        self._emit("error", f"等待回复失败（超时或连接断开）: {message.sf}")
 
     def on_error(self, error: Exception) -> None:
         self._emit("error", f"{type(error).__name__}: {error}")
@@ -364,6 +364,8 @@ class SimulatorEndpoint(SECSEventHandler):
             ok = await self._driver.send_reply(request, reply_items)
             if ok:
                 self._emit("log", f"已自动回复 {request.sf}")
+            else:
+                self._emit("error", f"自动回复 {request.sf} 未发出（会话未 Selected）")
         except Exception as exc:
             self._emit("error", f"自动回复失败: {exc}")
 

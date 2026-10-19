@@ -4,11 +4,11 @@ SECS-II 消息和数据项定义
 定义 SECSMessage 和 SECSItem 类，用于表示 SECS-II 协议的消息结构。
 """
 
-from typing import Any, List, Optional, Union
+from typing import Any, List, Optional
 from dataclasses import dataclass, field
 import uuid
 
-from .secs_types import SECSType, SECSTypeInfo, encode_format, encode_length
+from .secs_types import SECSType, SECSTypeInfo
 
 
 @dataclass
@@ -23,37 +23,6 @@ class SECSItem:
     type: SECSType
     value: Any = None
     children: List["SECSItem"] = field(default_factory=list)
-
-    def __post_init__(self):
-        """验证数据项的有效性"""
-        if self.type == SECSType.LIST:
-            # LIST 类型不需要 value，使用 children
-            if self.children is None:
-                self.children = []
-        else:
-            # 非 LIST 类型需要 value
-            if self.value is None and self.type not in (SECSItem.get_placeholder_type()):
-                pass  # 允许创建空值占位符
-
-    @staticmethod
-    def get_placeholder_type() -> List[SECSType]:
-        """获取需要 value 的类型列表"""
-        return [
-            SECSType.BOOLEAN,
-            SECSType.ASCII,
-            SECSType.INT8,
-            SECSType.INT1,
-            SECSType.INT4,
-            SECSType.INT2,
-            SECSType.UINT8,
-            SECSType.UINT1,
-            SECSType.UINT4,
-            SECSType.UINT2,
-            SECSType.FLOAT8,
-            SECSType.FLOAT4,
-            SECSType.JIS8,
-            SECSType.BINARY,
-        ]
 
     @staticmethod
     def list_(children: List["SECSItem"] = None) -> "SECSItem":

@@ -12,6 +12,7 @@ from typing import Callable, Optional
 import logging
 import struct
 
+from .config import HSMSConfig
 from .secs_message import SECSMessage
 from .secs_parser import SECSEncoder, SECSParser
 
@@ -33,6 +34,15 @@ class HSMSMessageType(IntEnum):
     SEPARATE_REQUEST = 0x09
 
 
+class HSMSRejectReason(IntEnum):
+    """HSMS Reject.req 原因码（SEMI E37）。"""
+
+    UNSUPPORTED_STYPE = 1  # 不支持的 SType
+    UNSUPPORTED_PTYPE = 2  # 不支持的 PType
+    TRANSACTION_NOT_OPEN = 3  # 事务不存在（收到无法匹配的 Secondary）
+    ENTITY_NOT_SELECTED = 4  # 实体未处于 Selected 状态
+
+
 class HSMSConnectionState(IntEnum):
     """HSMS 连接状态。"""
 
@@ -52,6 +62,8 @@ class HSMSMessage:
     message_type: HSMSMessageType = HSMSMessageType.DATA_MESSAGE
     secs_message: Optional[SECSMessage] = None
     p_type: int = 0
+    # 控制消息的 Header Byte2/Byte3：
+    # Select.rsp 为 SelectStatus，Reject.req 为 RejectReason，其余为 0
     stream: int = 0
     function: int = 0
     w_bit: bool = False
@@ -71,17 +83,6 @@ class HSMSMessage:
         if self.secs_message is not None:
             return self.secs_message.system_bytes[:4].ljust(4, b"\x00")
         return self.system_bytes_data[:4].ljust(4, b"\x00")
-
-
-@dataclass
-class HSMSConfig:
-    """HSMS 协议配置。"""
-
-    t3_timeout: float = 45.0
-    t5_timeout: float = 10.0
-    t6_timeout: float = 5.0
-    t7_timeout: float = 10.0
-    t8_timeout: float = 5.0
 
 
 class HSMSProtocolHandler:
@@ -123,12 +124,16 @@ class HSMSProtocolHandler:
         return struct.pack(">I", len(payload)) + payload
 
     def _encode_control_message(self, message: HSMSMessage) -> bytes:
-        """编码控制消息。"""
+        """编码控制消息。
+
+        Header Byte2/Byte3 对多数控制消息为 0；
+        Select.rsp 使用 Byte2 携带 SelectStatus，Reject.req 使用 Byte2 携带 RejectReason。
+        """
         system_value = int.from_bytes(message.system_bytes, byteorder="big")
         return self.HEADER_STRUCT.pack(
             self.CONTROL_SESSION_ID,
-            0x00,
-            0x00,
+            message.stream & 0xFF,
+            message.function & 0xFF,
             message.p_type & 0xFF,
             int(message.message_type) & 0xFF,
             system_value,
@@ -143,12 +148,28 @@ class HSMSProtocolHandler:
     def feed(self, data: bytes) -> list[HSMSMessage]:
         """
         将原始 TCP 数据分帧成 HSMS 报文。
+
+        超过 max_frame_size 的长度字段视为协议错误：丢弃缓冲，
+        避免恶意/异常数据导致内存无限增长。
         """
         self._buffer.extend(data)
         messages = []
 
         while len(self._buffer) >= self.LENGTH_BYTES:
             length = struct.unpack(">I", self._buffer[: self.LENGTH_BYTES])[0]
+
+            if length > self.config.max_frame_size:
+                logger.error(
+                    f"HSMS frame length {length} exceeds max_frame_size "
+                    f"{self.config.max_frame_size}; dropping buffer"
+                )
+                self._buffer.clear()
+                self._trigger_callback(
+                    "frame_error",
+                    ValueError(f"HSMS frame length {length} exceeds max_frame_size"),
+                )
+                break
+
             total_length = self.LENGTH_BYTES + length
             if len(self._buffer) < total_length:
                 break
@@ -161,6 +182,10 @@ class HSMSProtocolHandler:
                 messages.append(decoded)
 
         return messages
+
+    def reset(self) -> None:
+        """清空分帧缓冲（断开/重连时调用，避免残留半包污染新连接）。"""
+        self._buffer.clear()
 
     def decode_message(self, data: bytes) -> Optional[HSMSMessage]:
         """
@@ -221,10 +246,14 @@ class HSMSProtocolHandler:
             system_bytes_data=system_bytes or self._next_control_system_bytes(),
         )
 
-    def create_select_response(self, system_bytes: bytes = None) -> HSMSMessage:
+    def create_select_response(
+        self, system_bytes: bytes = None, status: int = 0
+    ) -> HSMSMessage:
+        """创建 Select.rsp；status 为 SelectStatus（Byte2），0 = Accept。"""
         return HSMSMessage(
             session_id=self.CONTROL_SESSION_ID,
             message_type=HSMSMessageType.SELECT_RESPONSE,
+            stream=status & 0xFF,
             system_bytes_data=system_bytes or self._next_control_system_bytes(),
         )
 
@@ -263,6 +292,17 @@ class HSMSProtocolHandler:
             system_bytes_data=system_bytes or self._next_control_system_bytes(),
         )
 
+    def create_reject_request(
+        self, reason: int, system_bytes: bytes = None
+    ) -> HSMSMessage:
+        """创建 Reject.req；reason 为 HSMSRejectReason（Byte2）。"""
+        return HSMSMessage(
+            session_id=self.CONTROL_SESSION_ID,
+            message_type=HSMSMessageType.REJECT_REQUEST,
+            stream=int(reason) & 0xFF,
+            system_bytes_data=system_bytes or self._next_control_system_bytes(),
+        )
+
     def update_state(self, new_state: HSMSConnectionState) -> None:
         old_state = self.state
         self.state = new_state
@@ -283,24 +323,43 @@ class HSMSConnectionStateMachine:
     def __init__(self, handler: HSMSProtocolHandler):
         self.handler = handler
         self.handler.state = HSMSConnectionState.NOT_CONNECTED
+        self._select_system_bytes: Optional[bytes] = None
 
     def handle_tcp_connected(self) -> None:
         if self.handler.state == HSMSConnectionState.NOT_CONNECTED:
             self.handler.update_state(HSMSConnectionState.CONNECTED)
 
     def handle_tcp_disconnected(self) -> None:
+        self._select_system_bytes = None
         self.handler.update_state(HSMSConnectionState.NOT_CONNECTED)
 
     def handle_select_request(self, system_bytes: bytes) -> HSMSMessage:
         self.handler.update_state(HSMSConnectionState.SELECTED)
         return self.handler.create_select_response(system_bytes=system_bytes)
 
-    def handle_select_response(self) -> bool:
+    def handle_select_response(
+        self, system_bytes: Optional[bytes] = None, status: int = 0
+    ) -> bool:
+        """处理 Select.rsp：校验 system bytes 与 SelectStatus。"""
+        if (
+            self._select_system_bytes is not None
+            and system_bytes is not None
+            and system_bytes != self._select_system_bytes
+        ):
+            logger.warning("Select.rsp system bytes mismatch; ignored")
+            return False
+
+        if status not in (0, 1):  # 0 = Accept, 1 = Already active
+            logger.error(f"Select.rsp rejected with status {status}")
+            self._select_system_bytes = None
+            return False
+
         if self.handler.state in (
             HSMSConnectionState.WAIT_SELECT,
             HSMSConnectionState.CONNECTED,
             HSMSConnectionState.NOT_SELECTED,
         ):
+            self._select_system_bytes = None
             self.handler.update_state(HSMSConnectionState.SELECTED)
             return True
         return False
@@ -311,7 +370,9 @@ class HSMSConnectionStateMachine:
             HSMSConnectionState.NOT_SELECTED,
         ):
             self.handler.update_state(HSMSConnectionState.WAIT_SELECT)
-            return self.handler.create_select_request()
+            request = self.handler.create_select_request()
+            self._select_system_bytes = request.system_bytes
+            return request
         return None
 
     def handle_deselect_request(self, system_bytes: bytes) -> HSMSMessage:
@@ -326,6 +387,7 @@ class HSMSConnectionStateMachine:
             self.handler.update_state(HSMSConnectionState.NOT_SELECTED)
 
     def handle_separate_request(self) -> None:
+        self._select_system_bytes = None
         self.handler.update_state(HSMSConnectionState.NOT_CONNECTED)
 
     def handle_linktest(self, system_bytes: bytes) -> HSMSMessage:

@@ -4,13 +4,15 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 import xml.etree.ElementTree as ET
 
 
-DEFAULT_MODEL_XML = "/Users/luxinyu/work/个人/EAP/Model.xml"
+# 默认模板路径可通过环境变量指定，避免在库代码里硬编码个人路径
+DEFAULT_MODEL_XML = os.environ.get("SECS_MODEL_XML", "").strip()
 
 
 @dataclass
@@ -42,7 +44,13 @@ class MessageTemplate:
 
 def load_model_templates(xml_path: str) -> List[MessageTemplate]:
     """读取 Model.xml 并转换为模板列表。"""
-    path = Path(xml_path).expanduser()
+    path_text = (xml_path or "").strip()
+    if not path_text:
+        raise ValueError(
+            "模板 XML 路径为空，请选择 Model.xml（或设置环境变量 SECS_MODEL_XML）"
+        )
+
+    path = Path(path_text).expanduser()
     root = ET.parse(path).getroot()
 
     templates: List[MessageTemplate] = []
@@ -129,10 +137,3 @@ def _format_scalar(format_name: str) -> str:
         "F8": "<F8 0>",
     }
     return mapping.get(normalized, f"<{normalized}>")
-
-
-def _ensure_default_binary_values(text: str) -> str:
-    """把空的二进制骨架补成 00，避免 ACK 类字段默认为空。"""
-    if not text:
-        return text
-    return text.replace("<B>", "<B 00>")

@@ -313,74 +313,78 @@ secs_driver:
 ### 8.1 单元测试
 
 ```python
-def test_parse_list():
-    """测试 LIST 解析"""
-    data = b'\x01\x01\x00\x01\x04\x00\x00\x00\x02\x41\x00\x41\x01'
-    item = SECSParser.parse(data)
-    assert item.type == SECSType.LIST
-    assert len(item.children) == 2
+def test_list_roundtrip():
+    """测试 LIST 编解码"""
+    message = SECSMessage(stream=1, function=1, w_bit=True)
+    message.add_item(SECSItem.list_([SECSItem.ascii("A"), SECSItem.uint2(9)]))
 
-def test_encode_message():
-    """测试消息编码"""
-    msg = SECSMessage(stream=1, function=1, w_bit=False)
-    msg.items = [SECSItem(SECSType.LIST, [])]
-    encoded = SECSEncoder.encode(msg)
-    assert len(encoded) > 0
+    data = SECSEncoder.encode(message)
+    decoded = SECSParser().feed(data)[0]
+
+    assert decoded.items[0].type == SECSType.LIST
+    assert decoded.items[0].children[1].value == 9
+
+
+def test_hsms_timeout_completes_waiter():
+    """T3 超时后等待方必须返回 None，不能悬挂"""
+    manager = SessionManager(HSMSConfig(t3_timeout=0.2))
+    manager.protocol.update_state(HSMSConnectionState.SELECTED)
+
+    results = []
+    await manager.send_message(SECSMessage(1, 1, w_bit=True), wait_reply=True, callback=results.append)
+    await asyncio.sleep(0.5)
+
+    assert results == [None]
 ```
 
 ### 8.2 集成测试
 
 ```python
-def test_full_communication():
-    """测试完整通信流程"""
-    # 建立连接
-    driver.connect()
-    # 等待会话选中
-    time.sleep(2)
-    # 发送消息
-    reply = driver.send_message(create_s1f1_message())
-    assert reply is not None
+async def test_full_communication():
+    """测试完整通信流程（主动 ↔ 被动，本机回环）"""
+    await passive.connect()
+    await active.connect()
+    # 等待 Select 握手完成
+    assert await wait_until(lambda: active.is_selected and passive.is_selected)
+
+    reply = await active.send_message(1, 1, [SECSItem.ascii("PING")], wait_reply=True)
+    assert reply is not None and reply.sf == "S1F2"
+```
+
+完整的测试集见 `tests/`，运行方式：
+
+```bash
+pip install -e ".[dev]"
+python -m pytest
 ```
 
 ## 九、项目结构
 
 ```
-secs_driver/
-├── src/
+SecsDriver/
+├── secs_driver/                # 驱动包
 │   ├── __init__.py
-│   ├── secs_driver.py          # 主驱动类
-│   ├── connection/
-│   │   ├── __init__.py
-│   │   ├── connection_manager.py
-│   │   ├── tcp_client.py
-│   │   └── tcp_server.py
-│   ├── session/
-│   │   ├── __init__.py
-│   │   └── session_manager.py
-│   ├── protocol/
-│   │   ├── __init__.py
-│   │   ├── hsms_protocol.py
-│   │   └── secs_parser.py
-│   ├── message/
-│   │   ├── __init__.py
-│   │   ├── secs_message.py
-│   │   ├── secs_item.py
-│   │   └── message_handler.py
-│   └── config/
-│       ├── __init__.py
-│       └── driver_config.py
-├── tests/
-│   ├── __init__.py
-│   ├── test_parser.py
-│   ├── test_encoder.py
-│   ├── test_protocol.py
-│   └── test_integration.py
-├── docs/
-│   └── design.md
-├── README.md
+│   ├── secs_driver.py          # 主驱动类（SECSDriver / SECSEventHandler）
+│   ├── connection.py           # TCP 连接（主动/被动、自动重连）
+│   ├── session.py              # HSMS 会话/事务管理（T3 超时、心跳响应）
+│   ├── hsms_protocol.py        # HSMS 分帧、控制消息、连接状态机
+│   ├── message_handler.py      # 消息队列与发送调度
+│   ├── secs_message.py         # SECSMessage / SECSItem
+│   ├── secs_parser.py          # SECS-II 编解码器
+│   ├── secs_types.py           # SECS-II 数据类型定义
+│   ├── config.py               # 配置类（唯一权威来源）
+│   ├── task_utils.py           # 后台任务辅助
+│   ├── model_templates.py      # Model.xml 模板加载
+│   └── simulator_core.py       # 模拟器核心逻辑（与界面解耦）
+├── simulator.py                # Tkinter 模拟器界面
+├── tests/                      # pytest 测试（编解码/协议/会话/集成）
+├── pytest.ini
 ├── requirements.txt
-└── setup.py
+├── setup.py
+└── README.md
 ```
+
+> 模板 XML 默认路径通过环境变量 `SECS_MODEL_XML` 指定，也可在模拟器界面中选择文件。
 
 ## 十、后续工作
 
