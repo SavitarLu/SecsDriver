@@ -123,8 +123,10 @@ async def test_requeue_respects_max_retry() -> None:
     assert queued is not None
 
     assert await queue.requeue(queued) is True
-    assert queued.retry_count == 1
-    assert await queue.requeue(queued) is False
+    retried = await queue.dequeue(timeout=0.1)
+    assert retried is queued
+    assert retried.retry_count == 1
+    assert await queue.requeue(retried) is False
 
 
 async def test_send_loop_dispatches_without_head_of_line_blocking() -> None:

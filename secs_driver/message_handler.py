@@ -137,9 +137,26 @@ class MessageQueue:
             logger.warning(f"Message exceeded max retry count: {message.retry_count}")
             return False
 
-        message.retry_count += 1
-        await self.enqueue(message.secs_message, message.priority, message.callback)
-        return True
+        async with self._lock:
+            if len(self._queue) >= self.config.max_queue_size:
+                logger.warning("Message queue is full; cannot requeue message")
+                return False
+
+            message.retry_count += 1
+
+            # 保留同一个 QueuedMessage 对象，避免 retry_count 在重新入队时丢失。
+            inserted = False
+            for i, qm in enumerate(self._queue):
+                if message.priority < qm.priority:
+                    self._queue.insert(i, message)
+                    inserted = True
+                    break
+
+            if not inserted:
+                self._queue.append(message)
+
+            self._not_empty.notify()
+            return True
 
     @property
     def size(self) -> int:

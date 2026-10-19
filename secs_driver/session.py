@@ -47,14 +47,16 @@ class SessionManager:
     管理 HSMS 会话状态、事务和超时处理。
     """
 
-    def __init__(self, config: HSMSConfig = None):
+    def __init__(self, config: HSMSConfig = None, device_id: Optional[int] = None):
         """
         初始化会话管理器
 
         Args:
             config: HSMS 配置
+            device_id: 期望的 HSMS session/device id；None 表示不校验
         """
         self.config = config or HSMSConfig()
+        self.device_id = device_id
         self.protocol = HSMSProtocolHandler(self.config)
         self._state_machine = None  # 稍后初始化
 
@@ -85,17 +87,43 @@ class SessionManager:
         except Exception as e:
             logger.error(f"Callback error for {event}: {e}")
 
+    async def _trigger_callback_wait(self, event: str, *args, **kwargs) -> bool:
+        """触发发送类回调并等待完成；False 表示实际发送失败。"""
+        callback = self._callbacks.get(event)
+        if callback is None:
+            return True
+        try:
+            result = callback(*args, **kwargs)
+            if asyncio.iscoroutine(result):
+                result = await result
+            return result is not False
+        except Exception as e:
+            logger.error(f"Callback error for {event}: {e}")
+            return False
+
     async def initialize(self, state_machine) -> None:
         """初始化会话管理器"""
         self._state_machine = state_machine
 
         # 设置协议回调
         self.protocol.set_callback("state_changed", self._on_state_changed)
+        self.protocol.set_callback("unsupported_ptype", self._on_unsupported_protocol_type)
+        self.protocol.set_callback("unsupported_stype", self._on_unsupported_protocol_type)
 
     def _on_state_changed(self, old_state: HSMSConnectionState, new_state: HSMSConnectionState) -> None:
         """状态变化回调"""
         logger.info(f"Session state changed: {old_state} -> {new_state}")
         self._trigger_callback("state_changed", old_state, new_state)
+
+    def _on_unsupported_protocol_type(
+        self,
+        value: int,
+        system_bytes: bytes,
+        reason: HSMSRejectReason,
+    ) -> None:
+        """收到不支持的 PType/SType 时按 HSMS 规范回 Reject.req。"""
+        logger.warning(f"Unsupported protocol type value {value}; sending Reject.req")
+        self._send_reject(reason, system_bytes)
 
     async def generate_tid(self) -> int:
         """生成唯一事务 ID"""
@@ -169,13 +197,18 @@ class SessionManager:
 
             self._transactions[tid] = transaction
 
-            # 启动超时计时器
-            self._start_timeout_timer(tid, transaction.timeout)
+            sent = await self._trigger_callback_wait("send_with_reply", data, secs_message, tid)
+            if not sent:
+                await self.cancel_transaction(tid)
+                return None
 
-            self._trigger_callback("send_with_reply", data, secs_message, tid)
+            # 实际写入成功后再启动 T3，避免排队/发送耗时侵占事务等待时间。
+            self._start_timeout_timer(tid, transaction.timeout)
         else:
             # 无需回复，直接发送
-            self._trigger_callback("send_no_reply", data, secs_message, tid)
+            sent = await self._trigger_callback_wait("send_no_reply", data, secs_message, tid)
+            if not sent:
+                return None
 
         # 返回消息数据供发送
         return data
@@ -247,6 +280,14 @@ class SessionManager:
             if secs_message is None:
                 continue
 
+            if not self._is_expected_device(hsms_message, secs_message):
+                logger.warning(
+                    "Data message device/session id mismatch: "
+                    f"expected={self.device_id}, got session={hsms_message.session_id}, "
+                    f"device={secs_message.device_id}"
+                )
+                continue
+
             # 未 Selected 时收到数据消息：按 HSMS 规范回 Reject.req
             if not self.is_selected:
                 self._reject_not_selected(hsms_message)
@@ -256,6 +297,8 @@ class SessionManager:
 
             if tid in self._transactions:
                 await self._complete_transaction(tid, secs_message)
+            elif secs_message.is_reply:
+                self._reject_transaction_not_open(hsms_message)
             else:
                 self._trigger_callback("message_received", secs_message)
 
@@ -269,12 +312,30 @@ class SessionManager:
             "Data message received while not selected; sending Reject.req "
             f"(system_bytes={hsms_message.system_bytes.hex()})"
         )
-        reject = self.protocol.create_reject_request(
-            HSMSRejectReason.ENTITY_NOT_SELECTED,
-            system_bytes=hsms_message.system_bytes,
+        self._send_reject(HSMSRejectReason.ENTITY_NOT_SELECTED, hsms_message.system_bytes)
+
+    def _reject_transaction_not_open(self, hsms_message: HSMSMessage) -> None:
+        """收到无法匹配的 Secondary，回 Reject.req (reason=3)。"""
+        logger.warning(
+            "Secondary message has no open transaction; sending Reject.req "
+            f"(system_bytes={hsms_message.system_bytes.hex()})"
         )
+        self._send_reject(HSMSRejectReason.TRANSACTION_NOT_OPEN, hsms_message.system_bytes)
+
+    def _send_reject(self, reason: HSMSRejectReason, system_bytes: bytes) -> None:
+        """发送 Reject.req。"""
+        reject = self.protocol.create_reject_request(reason, system_bytes=system_bytes)
         data = self.protocol.encode_message(reject)
         self._trigger_callback("send_control_message", data)
+
+    def _is_expected_device(
+        self, hsms_message: HSMSMessage, secs_message: SECSMessage
+    ) -> bool:
+        """校验 incoming data message 的 session/device id。"""
+        if self.device_id is None:
+            return True
+        expected = self.device_id & 0xFFFF
+        return hsms_message.session_id == expected and secs_message.device_id == expected
 
     async def _handle_control_message(self, hsms_message: HSMSMessage) -> None:
         """处理 HSMS 控制消息"""
@@ -343,6 +404,14 @@ class SessionManager:
             return
 
         transaction = self._transactions[tid]
+        if not self._is_valid_reply(transaction, reply):
+            logger.warning(
+                f"Unexpected reply for transaction {tid}: "
+                f"request={transaction.request.sf if transaction.request else '<unknown>'}, "
+                f"reply={reply.sf}"
+            )
+            return
+
         transaction.reply = reply
         transaction.completed = True
 
@@ -357,6 +426,15 @@ class SessionManager:
         self._trigger_callback("reply_received", reply, tid)
 
         await self._cleanup_transaction(tid)
+
+    def _is_valid_reply(self, transaction: Transaction, reply: SECSMessage) -> bool:
+        """校验 Secondary 是否匹配原事务。"""
+        request = transaction.request
+        if request is None:
+            return True
+        if not reply.is_reply or reply.w_bit:
+            return False
+        return reply.stream == request.stream and reply.function == request.function + 1
 
     async def _cleanup_transaction(self, tid: int) -> None:
         """清理事务"""

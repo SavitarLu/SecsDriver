@@ -74,6 +74,44 @@ def test_empty_message_roundtrip() -> None:
     assert decoded.items == []
 
 
+@pytest.mark.parametrize(
+    "item, expected",
+    [
+        pytest.param(SECSItem.uint4([1, 2, 3]), [1, 2, 3], id="uint4-array"),
+        pytest.param(SECSItem.int2([-1, 0, 1]), [-1, 0, 1], id="int2-array"),
+        pytest.param(SECSItem.boolean([True, False, True]), [True, False, True], id="bool-array"),
+        pytest.param(SECSItem.float4([1.25, 2.5]), [1.25, 2.5], id="float4-array"),
+    ],
+)
+def test_array_scalar_roundtrip(item: SECSItem, expected) -> None:
+    message = SECSMessage(stream=1, function=1)
+    message.add_item(item)
+
+    decoded = _roundtrip(message)
+
+    assert decoded.items[0].type == item.type
+    assert decoded.items[0].value == expected
+
+
+def test_jis8_non_ascii_roundtrip() -> None:
+    message = SECSMessage(stream=1, function=1)
+    message.add_item(SECSItem.jis8("テスト"))
+
+    decoded = _roundtrip(message)
+
+    assert decoded.items[0].value == "テスト"
+
+
+def test_fixed_size_item_rejects_invalid_payload_length() -> None:
+    message = SECSMessage(stream=1, function=1)
+    encoded = SECSEncoder.encode(message)
+    # U4 header declares 3 payload bytes, which is not divisible by U4 element size.
+    malformed = encoded + bytes([(SECSType.UINT4 << 2) | 1, 3, 0, 0, 1])
+
+    with pytest.raises(ValueError, match="UINT4 payload length"):
+        SECSParser().feed(malformed)
+
+
 def test_secs_parser_returns_empty_for_incomplete_data() -> None:
     parser = SECSParser()
     assert parser.feed(b"") == []

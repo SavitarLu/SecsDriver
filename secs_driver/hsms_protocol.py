@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 import logging
 import struct
+import time
 
 from .config import HSMSConfig
 from .secs_message import SECSMessage
@@ -103,6 +104,7 @@ class HSMSProtocolHandler:
         self.state = HSMSConnectionState.NOT_CONNECTED
         self._callbacks = {}
         self._buffer = bytearray()
+        self._partial_started_at: Optional[float] = None
         self._next_control_system = 1
 
     def set_callback(self, event: str, callback: Callable) -> None:
@@ -152,21 +154,27 @@ class HSMSProtocolHandler:
         超过 max_frame_size 的长度字段视为协议错误：丢弃缓冲，
         避免恶意/异常数据导致内存无限增长。
         """
+        now = time.monotonic()
+        self.check_t8_timeout(now)
+
+        if data and not self._buffer:
+            self._partial_started_at = now
+
         self._buffer.extend(data)
         messages = []
 
         while len(self._buffer) >= self.LENGTH_BYTES:
             length = struct.unpack(">I", self._buffer[: self.LENGTH_BYTES])[0]
 
-            if length > self.config.max_frame_size:
-                logger.error(
-                    f"HSMS frame length {length} exceeds max_frame_size "
-                    f"{self.config.max_frame_size}; dropping buffer"
+            if length < self.HEADER_SIZE:
+                self._drop_buffer_with_error(
+                    ValueError(f"HSMS frame length {length} is shorter than header size")
                 )
-                self._buffer.clear()
-                self._trigger_callback(
-                    "frame_error",
-                    ValueError(f"HSMS frame length {length} exceeds max_frame_size"),
+                break
+
+            if length > self.config.max_frame_size:
+                self._drop_buffer_with_error(
+                    ValueError(f"HSMS frame length {length} exceeds max_frame_size")
                 )
                 break
 
@@ -176,16 +184,46 @@ class HSMSProtocolHandler:
 
             payload = bytes(self._buffer[self.LENGTH_BYTES : total_length])
             del self._buffer[:total_length]
+            self._partial_started_at = time.monotonic() if self._buffer else None
 
             decoded = self._decode_payload(payload)
             if decoded is not None:
                 messages.append(decoded)
+
+        if not self._buffer:
+            self._partial_started_at = None
 
         return messages
 
     def reset(self) -> None:
         """清空分帧缓冲（断开/重连时调用，避免残留半包污染新连接）。"""
         self._buffer.clear()
+        self._partial_started_at = None
+
+    def check_t8_timeout(self, now: Optional[float] = None) -> bool:
+        """
+        检查半包是否已超过 T8。
+
+        Returns:
+            True 表示发现超时并已丢弃缓冲。
+        """
+        if not self._buffer or self._partial_started_at is None:
+            return False
+        current = time.monotonic() if now is None else now
+        elapsed = current - self._partial_started_at
+        if elapsed <= self.config.t8_timeout:
+            return False
+        self._drop_buffer_with_error(
+            ValueError(f"HSMS partial frame timed out after {elapsed:.3f}s")
+        )
+        return True
+
+    def _drop_buffer_with_error(self, error: ValueError) -> None:
+        """丢弃当前分帧缓冲并通知协议错误。"""
+        logger.error(str(error))
+        self._buffer.clear()
+        self._partial_started_at = None
+        self._trigger_callback("frame_error", error)
 
     def decode_message(self, data: bytes) -> Optional[HSMSMessage]:
         """
@@ -206,6 +244,24 @@ class HSMSProtocolHandler:
             system_bytes = system_value.to_bytes(4, byteorder="big")
             stream = stream_byte & 0x7F
             w_bit = (stream_byte & 0x80) != 0
+
+            if p_type != 0:
+                self._trigger_callback(
+                    "unsupported_ptype",
+                    p_type,
+                    system_bytes,
+                    HSMSRejectReason.UNSUPPORTED_PTYPE,
+                )
+                return None
+
+            if s_type not in {int(item) for item in HSMSMessageType}:
+                self._trigger_callback(
+                    "unsupported_stype",
+                    s_type,
+                    system_bytes,
+                    HSMSRejectReason.UNSUPPORTED_STYPE,
+                )
+                return None
 
             if s_type == HSMSMessageType.DATA_MESSAGE:
                 secs_messages = self.parser.feed(payload)

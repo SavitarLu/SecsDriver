@@ -7,6 +7,7 @@ SECS-II 解析器和编码器。
 
 import struct
 from typing import Any, Optional
+from collections.abc import Sequence
 import logging
 
 from .secs_types import (
@@ -124,29 +125,37 @@ class SECSParser:
             return None
 
         if secs_type == SECSType.BOOLEAN:
-            return data[offset] != 0
-        if secs_type == SECSType.INT8:
-            return struct.unpack(">q", data[offset : offset + 8])[0]
-        if secs_type == SECSType.INT1:
-            return struct.unpack(">b", data[offset : offset + 1])[0]
-        if secs_type == SECSType.UINT8:
-            return struct.unpack(">Q", data[offset : offset + 8])[0]
-        if secs_type == SECSType.UINT1:
-            return struct.unpack(">B", data[offset : offset + 1])[0]
-        if secs_type == SECSType.INT4:
-            return struct.unpack(">i", data[offset : offset + 4])[0]
-        if secs_type == SECSType.UINT4:
-            return struct.unpack(">I", data[offset : offset + 4])[0]
-        if secs_type == SECSType.INT2:
-            return struct.unpack(">h", data[offset : offset + 2])[0]
-        if secs_type == SECSType.UINT2:
-            return struct.unpack(">H", data[offset : offset + 2])[0]
-        if secs_type == SECSType.FLOAT8:
-            return struct.unpack(">d", data[offset : offset + 8])[0]
-        if secs_type == SECSType.FLOAT4:
-            return struct.unpack(">f", data[offset : offset + 4])[0]
-        if secs_type in (SECSType.ASCII, SECSType.JIS8):
+            values = [byte != 0 for byte in data[offset : offset + size]]
+            return values[0] if len(values) == 1 else values
+
+        numeric_formats = {
+            SECSType.INT8: (8, ">q"),
+            SECSType.INT1: (1, ">b"),
+            SECSType.UINT8: (8, ">Q"),
+            SECSType.UINT1: (1, ">B"),
+            SECSType.INT4: (4, ">i"),
+            SECSType.UINT4: (4, ">I"),
+            SECSType.INT2: (2, ">h"),
+            SECSType.UINT2: (2, ">H"),
+            SECSType.FLOAT8: (8, ">d"),
+            SECSType.FLOAT4: (4, ">f"),
+        }
+        if secs_type in numeric_formats:
+            item_size, fmt = numeric_formats[secs_type]
+            if size % item_size != 0:
+                raise ValueError(
+                    f"{secs_type.name} payload length {size} is not a multiple of {item_size}"
+                )
+            values = [
+                struct.unpack(fmt, data[index : index + item_size])[0]
+                for index in range(offset, offset + size, item_size)
+            ]
+            return values[0] if len(values) == 1 else values
+
+        if secs_type == SECSType.ASCII:
             return data[offset : offset + size].decode("latin-1").rstrip("\x00")
+        if secs_type == SECSType.JIS8:
+            return data[offset : offset + size].decode("iso-2022-jp").rstrip("\x00")
         if secs_type == SECSType.BINARY:
             return bytes(data[offset : offset + size])
 
@@ -191,10 +200,7 @@ class SECSEncoder:
 
     @staticmethod
     def _encode_items(items: list[SECSItem]) -> bytes:
-        result = b""
-        for item in items:
-            result += SECSEncoder._encode_single_item(item)
-        return result
+        return b"".join(SECSEncoder._encode_single_item(item) for item in items)
 
     @staticmethod
     def _encode_single_item(item: SECSItem) -> bytes:
@@ -227,25 +233,32 @@ class SECSEncoder:
             return b""
 
         if secs_type == SECSType.BOOLEAN:
-            return bytes([0x01 if value else 0x00])
-        if secs_type == SECSType.INT8:
-            return struct.pack(">q", int(value))
-        if secs_type == SECSType.INT1:
-            return struct.pack(">b", int(value))
-        if secs_type == SECSType.UINT8:
-            return struct.pack(">Q", int(value))
-        if secs_type == SECSType.UINT1:
-            return struct.pack(">B", int(value))
-        if secs_type == SECSType.INT4:
-            return struct.pack(">i", int(value))
-        if secs_type == SECSType.UINT4:
-            return struct.pack(">I", int(value))
-        if secs_type == SECSType.INT2:
-            return struct.pack(">h", int(value))
-        if secs_type == SECSType.UINT2:
-            return struct.pack(">H", int(value))
-        if secs_type == SECSType.FLOAT8:
-            return struct.pack(">d", float(value))
-        if secs_type == SECSType.FLOAT4:
-            return struct.pack(">f", float(value))
+            values = SECSEncoder._as_sequence(value)
+            return bytes(0x01 if item else 0x00 for item in values)
+
+        numeric_formats = {
+            SECSType.INT8: ">q",
+            SECSType.INT1: ">b",
+            SECSType.UINT8: ">Q",
+            SECSType.UINT1: ">B",
+            SECSType.INT4: ">i",
+            SECSType.UINT4: ">I",
+            SECSType.INT2: ">h",
+            SECSType.UINT2: ">H",
+            SECSType.FLOAT8: ">d",
+            SECSType.FLOAT4: ">f",
+        }
+        if secs_type in numeric_formats:
+            fmt = numeric_formats[secs_type]
+            values = SECSEncoder._as_sequence(value)
+            if secs_type in (SECSType.FLOAT8, SECSType.FLOAT4):
+                return b"".join(struct.pack(fmt, float(item)) for item in values)
+            return b"".join(struct.pack(fmt, int(item)) for item in values)
         return b""
+
+    @staticmethod
+    def _as_sequence(value: Any) -> Sequence:
+        """将标量或数组值统一为序列，字符串/bytes 不按数组展开。"""
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            return value
+        return (value,)

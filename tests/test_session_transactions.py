@@ -117,3 +117,48 @@ async def test_send_message_while_not_selected_returns_none() -> None:
 
     data = await manager.send_message(SECSMessage(1, 1, w_bit=True), wait_reply=True)
     assert data is None
+
+
+async def test_unknown_secondary_is_rejected() -> None:
+    manager = _selected_session()
+    sent = []
+    manager.set_callback("send_control_message", sent.append)
+
+    reply = SECSMessage(1, 2, w_bit=False, system_bytes=b"\x00\x00\x00\x99")
+    await manager.receive_message(_data_wire(manager, reply))
+
+    assert len(sent) == 1
+    frames = HSMSProtocolHandler().feed(sent[0])
+    assert frames[0].message_type == HSMSMessageType.REJECT_REQUEST
+    assert frames[0].stream == int(HSMSRejectReason.TRANSACTION_NOT_OPEN)
+    assert frames[0].system_bytes == reply.system_bytes
+
+
+async def test_mismatched_reply_does_not_complete_transaction() -> None:
+    manager = _selected_session(t3=5.0)
+    results = []
+    request = SECSMessage(1, 1, w_bit=True)
+
+    await manager.send_message(request, wait_reply=True, callback=results.append)
+    tid = manager._bytes_to_tid(request.system_bytes)
+
+    wrong_reply = SECSMessage(
+        2, 2, w_bit=False, system_bytes=request.system_bytes
+    )
+    await manager.receive_message(_data_wire(manager, wrong_reply))
+
+    assert results == []
+    assert tid in manager._transactions
+    await manager.cancel_all_transactions("test cleanup")
+
+
+async def test_incoming_device_id_mismatch_is_ignored() -> None:
+    manager = SessionManager(HSMSConfig(), device_id=7)
+    manager.protocol.update_state(HSMSConnectionState.SELECTED)
+    received = []
+    manager.set_callback("message_received", received.append)
+
+    request = SECSMessage(1, 1, w_bit=True, device_id=8)
+    await manager.receive_message(_data_wire(manager, request))
+
+    assert received == []

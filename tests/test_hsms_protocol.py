@@ -59,6 +59,32 @@ def test_feed_rejects_oversized_frame_length() -> None:
     assert "exceeds" in str(errors[0])
 
 
+def test_feed_rejects_short_frame_length() -> None:
+    errors = []
+    handler = HSMSProtocolHandler()
+    handler.set_callback("frame_error", errors.append)
+
+    assert handler.feed(struct.pack(">I", 1) + b"\x00") == []
+
+    assert len(handler._buffer) == 0
+    assert len(errors) == 1
+    assert "shorter than header" in str(errors[0])
+
+
+def test_partial_frame_t8_timeout_clears_buffer() -> None:
+    errors = []
+    handler = HSMSProtocolHandler(HSMSConfig(t8_timeout=0.1))
+    handler.set_callback("frame_error", errors.append)
+
+    assert handler.feed(struct.pack(">I", 20) + b"\x00") == []
+    assert handler._partial_started_at is not None
+
+    assert handler.check_t8_timeout(handler._partial_started_at + 0.2) is True
+    assert len(handler._buffer) == 0
+    assert len(errors) == 1
+    assert "timed out" in str(errors[0])
+
+
 @pytest.mark.parametrize(
     "message_type",
     [

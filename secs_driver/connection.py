@@ -395,10 +395,16 @@ class TCPServer(TCPConnection):
 
     async def force_reconnect(self) -> None:
         """关闭当前客户端连接，继续监听等待对端重连。"""
-        writer = self._client_writer
+        writer, self._client_writer = self._client_writer, None
+        self._client_reader = None
+        self._connected = False
         if writer is not None:
             logger.info("Closing client connection to force peer reconnect")
             writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=5.0)
+            except Exception as e:
+                logger.warning(f"Error closing client connection: {e}")
 
     async def disconnect(self) -> None:
         """停止服务器并断开客户端。"""
@@ -452,7 +458,9 @@ def create_connection(config: ConnectionConfig) -> TCPConnection:
     Returns:
         TCP 连接实例
     """
-    if config.mode.lower() == "active":
+    mode = config.mode.lower()
+    if mode == "active":
         return TCPClient(config)
-    else:
+    if mode == "passive":
         return TCPServer(config)
+    raise ValueError(f"Unsupported connection mode: {config.mode}")

@@ -176,7 +176,9 @@ class SECSDriver:
             self._connection = create_connection(self.config.connection)
 
             # 创建会话管理器
-            self._session_manager = SessionManager(self.config.hsms)
+            self._session_manager = SessionManager(
+                self.config.hsms, device_id=self.config.device_id
+            )
 
             # 创建消息处理器
             self._message_handler = MessageHandler(self.config.message_queue)
@@ -371,23 +373,20 @@ class SECSDriver:
 
     async def _on_send_message(
         self, data: bytes, message: SECSMessage, tid: int
-    ) -> None:
-        """发送数据消息。"""
+    ) -> bool:
+        """发送数据消息；返回是否已实际写入 transport。"""
         if not self._connection or not self._connection.is_connected:
             logger.warning(f"Skip sending {message.sf}, transport is not connected")
-            if self._session_manager:
-                await self._session_manager.cancel_transaction(tid)
-            return
+            return False
 
         try:
             await self._connection.send(data)
             self._last_activity = time.monotonic()
             logger.debug(f"Sent {message.sf} (tid={tid})")
+            return True
         except Exception as e:
             logger.error(f"Failed to send {message.sf}: {e}")
-            # 发送失败：立即结束事务，避免等待方滞留到 T3 超时
-            if self._session_manager:
-                await self._session_manager.cancel_transaction(tid)
+            return False
 
     async def _on_message_sent(self, message: SECSMessage) -> None:
         """消息发送回调"""
@@ -627,6 +626,13 @@ class SECSDriver:
 
         if not self.is_selected:
             logger.warning("Cannot send reply: session is not selected")
+            return False
+
+        if not original_message.w_bit or original_message.is_reply:
+            logger.warning(f"Cannot send reply for non-primary message: {original_message.sf}")
+            return False
+        if original_message.function >= 255:
+            logger.warning(f"Cannot create reply for function {original_message.function}")
             return False
 
         # 创建回复（沿用原消息的 system bytes）
